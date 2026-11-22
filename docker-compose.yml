@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_DB: bot
+      POSTGRES_PASSWORD_FILE: /credentials/password
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        if [ ! -s /credentials/password ]; then
+          umask 077
+          head -c 32 /dev/urandom | base64 | tr -d '\n' > /credentials/password
+        fi
+        exec docker-entrypoint.sh postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - credentials:/credentials
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+  bot:
+    build: .
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN}
+      DB_PASSWORD_FILE: /credentials/password
+    env_file: .env
+    volumes:
+      - credentials:/credentials:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os,time; assert time.time()-os.stat('/tmp/bot-heartbeat').st_mtime<60"]
+      interval: 30s
+      timeout: 4s
+      retries: 3
+    restart: unless-stopped
+volumes:
+  pgdata:
+  credentials:
