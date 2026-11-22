@@ -198,3 +198,48 @@ async def test_notification_delivery(monkeypatch):
     bot = AsyncMock()
     await telegram.notify(bot)
     assert delivery.sent and "WAITING" in bot.send_message.await_args.args[1]
+
+
+def test_market_rotation_while_priority_is_busy():
+    from bot.service import Service
+
+    svc = Service(None)
+    svc.instruments = {str(i): {} for i in range(888)}
+    svc.top = list(svc.instruments)[:48]
+    selected = set()
+    for slot in range(12):
+        for _ in range(8):
+            batch = svc.batch(slot)
+            assert len(batch) <= 16
+            assert all(svc.last_attempt.get(s) != slot for s in batch)
+            selected.update(batch)
+            svc.last_attempt.update(dict.fromkeys(batch, slot))
+    assert selected == set(svc.instruments)
+
+
+@pytest.mark.asyncio
+async def test_fast_rejection_avoids_slow_timeframes():
+    from bot.service import Service
+
+    api = AsyncMock()
+    api.bars.return_value = pd.DataFrame(
+        columns=["time", "open", "high", "low", "close", "volume"], dtype=float
+    )
+    assert await Service(api).analyze("TEST-USDT") is None
+    api.bars.assert_awaited_once_with("TEST-USDT", "5m")
+
+
+@pytest.mark.parametrize("d", [1, -1])
+def test_costs_reject_marginal_breakouts(d):
+    from bot.strategy import net_rr
+
+    stop, target = 100 - d, 100 + 2 * d
+    assert 0 < net_rr(100, stop, target, d, cfg) < 2
+    signal = SimpleNamespace(
+        direction="LONG" if d == 1 else "SHORT",
+        status="WAITING",
+        stop_loss=stop,
+        entry_price=100,
+        take_profit_1=target,
+    )
+    assert transition(signal, 100, 0) == "CANCELLED"

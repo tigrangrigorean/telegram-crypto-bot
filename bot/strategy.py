@@ -29,22 +29,45 @@ def indicators(frame, c=cfg):
     return f
 
 
+def fresh(frame, tf, end):
+    recent = frame.tail(50)
+    if len(recent) < 50:
+        return False
+    row = recent.iloc[-1]
+    return (
+        0 <= end - row.time - MS[tf] < MS[tf]
+        and (np.diff(recent.time) == MS[tf]).all()
+        and np.isfinite(row).all()
+    )
+
+
+def eligible_fast(frame, end, c=cfg):
+    if not fresh(frame, "5m", end):
+        return False
+    r = frame.iloc[-1]
+    return (
+        r.close > 0
+        and r.rv >= c.volume_ratio
+        and c.atr_min <= r.atr / r.close <= c.atr_max
+        and (r.close > r.res or r.close < r.sup)
+    )
+
+
+def net_rr(entry, stop, target, d, c):
+    fill = entry * (1 + d * c.slip)
+    loss_exit = stop * (1 - d * c.slip)
+    win_exit = target * (1 - d * c.slip)
+    risk = d * (fill - loss_exit) + c.fee * (fill + loss_exit)
+    reward = d * (win_exit - fill) - c.fee * (fill + win_exit)
+    return reward / risk if risk > 0 else 0.0
+
+
 def setup(frames, precision, end, c=cfg):
-    rows = []
-    for tf in MS:
-        f = frames[tf]
-        if len(f) < 50:
-            return
-        recent = f.tail(50)
-        r = recent.iloc[-1]
-        if (
-            not (0 <= end - r.time - MS[tf] < MS[tf])
-            or not (np.diff(recent.time) == MS[tf]).all()
-        ):
-            return
-        if not np.isfinite(r).all():
-            return
-        rows.append(r)
+    if not eligible_fast(frames["5m"], end, c):
+        return
+    if not all(fresh(frames[tf], tf, end) for tf in ("15m", "1h")):
+        return
+    rows = [frames[tf].iloc[-1] for tf in MS]
     r = rows[0]
     for d, direction in [(1, "LONG"), (-1, "SHORT")]:
         if not all(
@@ -72,7 +95,7 @@ def setup(frames, precision, end, c=cfg):
         if (
             min(entry, stop, tp1, tp2) <= 0
             or risk <= 0
-            or d * (tp1 - entry) / risk < c.min_rr
+            or net_rr(entry, stop, tp1, d, c) < c.min_rr
         ):
             continue
         return dict(
@@ -93,7 +116,7 @@ def setup(frames, precision, end, c=cfg):
             ),
             details=dict(
                 current=rnd(r.close),
-                rr=d * (tp1 - entry) / risk,
+                rr=net_rr(entry, stop, tp1, d, c),
                 timeframe="5m",
                 reasons=[
                     "5m/15m/1h EMA and MACD trend",
@@ -112,10 +135,9 @@ def transition(s, price, age, c=cfg):
         if d * (price - s.stop_loss) <= 0:
             return "CANCELLED"
         if d * (price - s.entry_price) >= 0:
-            reward = d * (s.take_profit_1 - price)
             return (
                 "ENTRY CONFIRMED"
-                if reward >= c.min_rr * d * (price - s.stop_loss) - 1e-12
+                if net_rr(price, s.stop_loss, s.take_profit_1, d, c) >= c.min_rr
                 else "CANCELLED"
             )
     if s.status == "ENTRY CONFIRMED":

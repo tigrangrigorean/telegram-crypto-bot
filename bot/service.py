@@ -3,13 +3,14 @@ import logging
 import time
 from datetime import timedelta
 
+import httpx
 from sqlalchemy import insert, select, update
 from sqlalchemy.dialects.postgresql import insert as upsert
 
 from .config import cfg
 from .db import Delivery, Event, Instrument, Signal, User, now, sessions
 from .market import MS, rank
-from .strategy import indicators, setup, transition
+from .strategy import eligible_fast, indicators, setup, transition
 
 ACTIVE = ("WAITING", "ENTRY CONFIRMED")
 log = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ class Service:
     def __init__(self, api):
         self.api = api
         self.instruments = {}
+        self.last_attempt = {}
         self.top = []
         self.baseline = {}
         self.active = set()
@@ -43,9 +45,9 @@ class Service:
         self.dropped = 0
 
     def targets(self):
-        return tuple(dict.fromkeys([*sorted(self.active), *self.top]))[
-            : min(20, cfg.candidates + 8)
-        ]
+        # Ranking changes within the same subscription set need no reconnect.
+        chosen = list(dict.fromkeys([*sorted(self.active), *self.top]))[:20]
+        return tuple(sorted(chosen))
 
     def tick(self, symbol, price, ts):
         if (
@@ -79,9 +81,17 @@ class Service:
                 )
             )
         self.instruments = instruments
+        self.last_attempt = {
+            s: t for s, t in self.last_attempt.items() if s in instruments
+        }
 
     async def analyze(self, symbol):
-        frames = {tf: indicators(await self.api.bars(symbol, tf)) for tf in MS}
+        fast = indicators(await self.api.bars(symbol, "5m"))
+        if not eligible_fast(fast, time.time() * 1000):
+            return
+        frames = {"5m": fast}
+        for tf in ("15m", "1h"):
+            frames[tf] = indicators(await self.api.bars(symbol, tf))
         return setup(
             frames, int(self.instruments[symbol]["pricePrecision"]), time.time() * 1000
         )
@@ -93,9 +103,28 @@ class Service:
             if r.get("closeTime") and r.get("lastPrice"):
                 self.tick(r["symbol"], float(r["lastPrice"]), int(r["closeTime"]))
 
+    def batch(self, slot):
+        due = [s for s in self.instruments if self.last_attempt.get(s, -1) < slot]
+        priority = [
+            s
+            for s in self.top
+            if s in self.instruments and self.last_attempt.get(s, -1) < slot
+        ][:8]
+        oldest = sorted(due, key=lambda s: (self.last_attempt.get(s, -1), s))
+        return list(dict.fromkeys(priority + oldest))[:16]
+
     async def scan(self):
-        for symbol in self.top.copy():
-            idea = await self.analyze(symbol)
+        slot = int(time.time() * 1000) // MS["5m"]
+        self.health["5m coverage"] = (
+            f"{sum(t == slot for t in self.last_attempt.values())}/{len(self.instruments)} attempted"
+        )
+        for symbol in self.batch(slot):
+            self.last_attempt[symbol] = slot
+            try:
+                idea = await self.analyze(symbol)
+            except (ValueError, KeyError, httpx.HTTPError) as exc:
+                log.warning("scan %s: %s", symbol, type(exc).__name__)
+                continue
             if not idea:
                 continue
             async with sessions.begin() as db:

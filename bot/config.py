@@ -6,8 +6,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
     telegram_bot_token: SecretStr | None = None
     database_url: str = "postgresql+asyncpg://bot@db/bot"
-    scan_seconds: int = Field(60, ge=10)
-    candidates: int = Field(8, ge=1, le=30)
+    scan_seconds: int = Field(1, ge=1)
+    candidates: int = Field(48, ge=1, le=200)
     quote_age: int = Field(30, ge=1)
     window: int = Field(20, ge=5, le=48)
     volume_ratio: float = Field(1.4, gt=0)
