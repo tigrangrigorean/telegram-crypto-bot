@@ -197,7 +197,7 @@ async def test_notification_delivery(monkeypatch):
     monkeypatch.setattr(telegram, "sessions", factory)
     bot = AsyncMock()
     await telegram.notify(bot)
-    assert delivery.sent and "WAITING" in bot.send_message.await_args.args[1]
+    assert delivery.sent and "Ждём входа" in bot.send_message.await_args.args[1]
 
 
 def test_market_rotation_while_priority_is_busy():

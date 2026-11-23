@@ -1,4 +1,6 @@
 import asyncio
+from datetime import timedelta
+from decimal import Decimal
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import (
@@ -15,16 +17,52 @@ from .db import Account, Delivery, Event, Position, Run, Signal, Trade, User, se
 HELP = "/start /stop /status /coins /top /signals /long /short /analyze BTCUSDT /stats /paper /backtest /help"
 
 
+def price_text(value):
+    return format(Decimal(str(value)).normalize(), "f")
+
+
 def message(s, event, price, timestamp):
-    return (
-        f"{event} · {s.symbol} · {s.direction} · 5m breakout\n"
-        f"Цена события {price:g} USDT · вход {s.entry_price:g}\n"
-        f"Условие входа — следующая сделка на уровне пробоя или дальше с R/R ≥ {cfg.min_rr:g}.\n"
-        f"SL {s.stop_loss:g} · TP1 {s.take_profit_1:g} · TP2 {s.take_profit_2:g}\n"
-        f"Плановый R/R 1:{s.details['rr']:.2f} · Score {s.score}/100\n"
-        + ", ".join(s.details["reasons"])
-        + f"\n{timestamp:%Y-%m-%d %H:%M:%S UTC}"
-    )
+    titles = {
+        "WAITING": "⏳ Ждём входа",
+        "ENTRY CONFIRMED": "✅ Вход подтверждён",
+        "CANCELLED": "↩️ Сигнал отменён",
+        "EXPIRED": "⌛ Время ожидания вышло",
+        "TP HIT": "🎯 Цель достигнута",
+        "SL HIT": "🛑 Сработал стоп",
+    }
+    entry = price_text(s.entry_price)
+    observed = price_text(price)
+    stop = price_text(s.stop_loss)
+    target = price_text(s.take_profit_1)
+    long = s.direction == "LONG"
+    heading = f"{titles[event]} · {s.symbol} · {s.direction}"
+    if event == "WAITING":
+        deadline = timestamp + timedelta(seconds=cfg.expiry)
+        side = "выше" if long else "ниже"
+        body = (
+            f"Пробой на 5 мин. Цена закрытия {observed} USDT.\n"
+            f"Ждём {entry} или {side} до {deadline:%H:%M:%S} UTC.\n\n"
+            f"Стоп {stop} · Цель {target}\n"
+            f"Дальняя цель {price_text(s.take_profit_2)}\n"
+            f"Потенциал к риску {s.details['rr']:.2f} к 1 (минимум {cfg.min_rr:g} к 1).\n"
+            f"Сила сигнала {s.score}/100."
+        )
+    elif event == "ENTRY CONFIRMED":
+        body = f"Цена подтверждения {observed} USDT.\nСтоп {stop} · Цель {target}"
+    elif event == "EXPIRED":
+        body = f"Бот ждал входа на уровне {entry} USDT. За отведённое время вход не подтвердился."
+    elif event == "CANCELLED":
+        hit_stop = price <= s.stop_loss if long else price >= s.stop_loss
+        reason = (
+            "Цена достигла стопа до входа."
+            if hit_stop
+            else "По этой цене потенциальная прибыль слишком мала относительно риска."
+        )
+        body = f"{reason}\nЦена отмены {observed} USDT."
+    else:
+        level = f"Цель {target}" if event == "TP HIT" else f"Стоп {stop}"
+        body = f"{level} · Бот зафиксировал {observed} USDT.\nСигнал закрыт."
+    return f"{heading}\n\n{body}\n\n{timestamp:%d.%m.%Y %H:%M:%S} UTC"
 
 
 def dispatcher(svc):
