@@ -243,3 +243,55 @@ def test_costs_reject_marginal_breakouts(d):
         take_profit_1=target,
     )
     assert transition(signal, 100, 0) == "CANCELLED"
+
+
+@pytest.mark.parametrize("d", [1, -1])
+def test_breakout_needs_distance_and_directional_close(d):
+    from bot.strategy import breakout_side
+
+    settings = cfg.model_copy(
+        update={"breakout_min_atr": 0.1, "breakout_close_fraction": 0.65}
+    )
+    where = frames(d)["5m"]
+    assert breakout_side(where, END, settings) == d
+    where.loc[59, "close"] = 100 + d * 0.01
+    assert breakout_side(where, END, settings) == 0
+    where.loc[59, "close"] = 100 + d * 0.2
+    where.loc[59, "high" if d == 1 else "low"] = 100 + d
+    assert breakout_side(where, END, settings) == 0
+
+
+@pytest.mark.asyncio
+async def test_scan_has_bounded_parallelism():
+    from bot.service import Service
+
+    svc = Service(None)
+    svc.instruments = {str(i): {} for i in range(16)}
+    active = peak = 0
+
+    async def analyze(symbol):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+
+    svc.analyze = analyze
+    await svc.scan()
+    assert len(svc.last_attempt) == 16
+    assert 1 < peak <= 8
+
+
+@pytest.mark.asyncio
+async def test_publish_rejects_wide_or_stale_spreads(monkeypatch):
+    from bot import service
+
+    svc = service.Service(None)
+    current = END / 1000
+    monkeypatch.setattr(service.time, "time", lambda: current)
+    sessions = MagicMock()
+    monkeypatch.setattr(service, "sessions", sessions)
+    for spread, timestamp in [(40, END), (5, END - (cfg.quote_age + 1) * 1000)]:
+        svc.spreads["X-USDT"] = (spread, timestamp)
+        await svc.publish("X-USDT", {"bar": END - MS["5m"]})
+    sessions.begin.assert_not_called()

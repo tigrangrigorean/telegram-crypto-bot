@@ -9,6 +9,8 @@ import aiohttp
 import httpx
 import pandas as pd
 
+from .config import cfg
+
 BASE = "https://open-api.bingx.com"
 WS = "wss://open-api-swap.bingx.com/swap-market"
 MS = {"5m": 300000, "15m": 900000, "1h": 3600000}
@@ -23,16 +25,26 @@ class PublicAPI:
 
     async def get(self, path, **params):
         for attempt in range(5):
-            async with self.lock:
-                await asyncio.sleep(max(0, self.next_request - time.monotonic()))
-                self.next_request = time.monotonic() + 0.55
+            while True:
+                async with self.lock:
+                    now = time.monotonic()
+                    wait = self.next_request - now
+                    if wait <= 0:
+                        self.next_request = now + 1 / cfg.rest_requests_per_second
+                        break
+                await asyncio.sleep(wait)
             delay = 2**attempt
             try:
                 r = await self.client.get(BASE + "/openApi/swap/" + path, params=params)
-                if r.status_code == 429 and r.headers.get("retry-after", "").isdigit():
-                    delay = max(delay, int(r.headers["retry-after"]))
+                payload = r.json() if r.is_success else None
+                if r.status_code == 429 or (payload and payload.get("code") == 100410):
+                    retry_after = r.headers.get("retry-after", "")
+                    delay = max(delay, int(retry_after) if retry_after.isdigit() else 5)
+                    async with self.lock:
+                        self.next_request = max(
+                            self.next_request, time.monotonic() + delay
+                        )
                 r.raise_for_status()
-                payload = r.json()
                 if payload["code"] != 0:
                     raise ValueError(f"BingX code {payload['code']}")
                 return payload["data"]
@@ -136,6 +148,16 @@ async def stream(targets, on_tick):
                 delay = min(delay * 2, 60)
 
 
+def ticker_spread_bps(row):
+    try:
+        bid, ask = float(row["bidPrice"]), float(row["askPrice"])
+    except (KeyError, ValueError, TypeError):
+        return None
+    if not (0 < bid <= ask and math.isfinite(ask)):
+        return None
+    return 20000 * ((ask - bid) / (ask + bid))
+
+
 def rank(rows, instruments, baseline):
     scores = {}
     for row in rows:
@@ -153,13 +175,18 @@ def rank(rows, instruments, baseline):
                     "priceChangePercent",
                 )
             )
-            if min(volume, price, low) <= 0:
+            if min(volume, price, low) <= 0 or not all(
+                math.isfinite(x) for x in (volume, price, high, low, change)
+            ):
                 continue
             previous = baseline.get(symbol)
             surprise = max(0, volume / previous - 1) if previous else 0
-            scores[symbol] = math.log1p(volume) * (
-                abs(change) / 100 + (high - low) / price + surprise
-            )
+            spread = ticker_spread_bps(row)
+            # Cap one-off moves and favor tight, actively traded markets.
+            activity = min((abs(change) / 100 + max(0, (high - low) / price)), 0.5)
+            liquidity = math.log1p(volume / 100_000)
+            cost = 1 + (spread if spread is not None else cfg.max_spread_bps) / 10
+            scores[symbol] = liquidity * (activity + min(surprise, 0.25)) / cost
             baseline[symbol] = (
                 volume if previous is None else 0.95 * previous + 0.05 * volume
             )

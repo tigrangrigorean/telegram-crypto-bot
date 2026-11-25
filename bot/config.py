@@ -8,9 +8,13 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://bot@db/bot"
     scan_seconds: int = Field(1, ge=1)
     candidates: int = Field(48, ge=1, le=200)
+    rest_requests_per_second: float = Field(5, ge=1, le=10)
     quote_age: int = Field(30, ge=1)
+    max_spread_bps: float = Field(25, gt=0)
     window: int = Field(20, ge=5, le=48)
     volume_ratio: float = Field(1.4, gt=0)
+    breakout_min_atr: float = Field(0, ge=0)
+    breakout_close_fraction: float = Field(0, ge=0, le=1)
     rsi_low: float = Field(50, ge=0, le=100)
     rsi_high: float = Field(78, ge=0, le=100)
     atr_min: float = Field(0.001, gt=0)

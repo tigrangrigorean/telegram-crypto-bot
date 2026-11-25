@@ -41,15 +41,40 @@ def fresh(frame, tf, end):
     )
 
 
-def eligible_fast(frame, end, c=cfg):
+def breakout_side(frame, end, c=cfg):
     if not fresh(frame, "5m", end):
-        return False
+        return 0
     r = frame.iloc[-1]
-    return (
+    if not (
         r.close > 0
         and r.rv >= c.volume_ratio
         and c.atr_min <= r.atr / r.close <= c.atr_max
-        and (r.close > r.res or r.close < r.sup)
+        and r.low <= r.close <= r.high
+        and r.low < r.high
+    ):
+        return 0
+    if r.close > r.res:
+        d, distance, close_strength = 1, r.close - r.res, r.close - r.low
+    elif r.close < r.sup:
+        d, distance, close_strength = -1, r.sup - r.close, r.high - r.close
+    else:
+        return 0
+    rsi = r.rsi if d == 1 else 100 - r.rsi
+    if (
+        distance < c.breakout_min_atr * r.atr
+        or close_strength < c.breakout_close_fraction * (r.high - r.low)
+        or not c.rsi_low <= rsi <= c.rsi_high
+        or not aligned(r, d)
+    ):
+        return 0
+    return d
+
+
+def aligned(row, d):
+    return (
+        d * (row.ema9 - row.ema21) > 0
+        and d * (row.ema21 - row.ema50) > 0
+        and d * row["hist"] > 0
     )
 
 
@@ -63,68 +88,53 @@ def net_rr(entry, stop, target, d, c):
 
 
 def setup(frames, precision, end, c=cfg):
-    if not eligible_fast(frames["5m"], end, c):
+    d = breakout_side(frames["5m"], end, c)
+    if not d:
         return
-    if not all(fresh(frames[tf], tf, end) for tf in ("15m", "1h")):
+    if not all(
+        fresh(frames[tf], tf, end) and aligned(frames[tf].iloc[-1], d)
+        for tf in ("15m", "1h")
+    ):
         return
-    rows = [frames[tf].iloc[-1] for tf in MS]
-    r = rows[0]
-    for d, direction in [(1, "LONG"), (-1, "SHORT")]:
-        if not all(
-            d * (x.ema9 - x.ema21) > 0
-            and d * (x.ema21 - x.ema50) > 0
-            and d * x["hist"] > 0
-            for x in rows
-        ):
-            continue
-        level = r.res if d == 1 else r.sup
-        strength = r.rsi if d == 1 else 100 - r.rsi
-        if not (
-            d * (r.close - level) > 0
-            and c.rsi_low <= strength <= c.rsi_high
-            and r.rv >= c.volume_ratio
-            and c.atr_min <= r.atr / r.close <= c.atr_max
-        ):
-            continue
-        rnd = lambda v: round(float(v), precision)
-        entry = rnd(r.high + 10**-precision if d == 1 else r.low - 10**-precision)
-        stop = rnd(level - d * c.stop_atr * r.atr)
-        width = r.res - r.sup
-        tp1, tp2 = rnd(level + d * width), rnd(level + d * 1.5 * width)
-        risk = d * (entry - stop)
-        if (
-            min(entry, stop, tp1, tp2) <= 0
-            or risk <= 0
-            or net_rr(entry, stop, tp1, d, c) < c.min_rr
-        ):
-            continue
-        return dict(
-            symbol=None,
-            bar=int(r.time),
-            direction=direction,
-            entry_price=entry,
-            stop_loss=stop,
-            take_profit_1=tp1,
-            take_profit_2=tp2,
-            score=min(
-                100,
-                70
-                + int(
-                    15 * min(r.rv / (2 * c.volume_ratio), 1)
-                    + 15 * min(d * (r.close - level) / r.atr, 1)
-                ),
+    direction = "LONG" if d == 1 else "SHORT"
+    r = frames["5m"].iloc[-1]
+    level = r.res if d == 1 else r.sup
+    rnd = lambda v: round(float(v), precision)
+    entry = rnd(r.high + 10**-precision if d == 1 else r.low - 10**-precision)
+    stop = rnd(level - d * c.stop_atr * r.atr)
+    width = r.res - r.sup
+    tp1, tp2 = rnd(level + d * width), rnd(level + d * 1.5 * width)
+    risk = d * (entry - stop)
+    rr = net_rr(entry, stop, tp1, d, c)
+    if min(entry, stop, tp1, tp2) <= 0 or risk <= 0 or rr < c.min_rr:
+        return
+    return dict(
+        symbol=None,
+        bar=int(r.time),
+        direction=direction,
+        entry_price=entry,
+        stop_loss=stop,
+        take_profit_1=tp1,
+        take_profit_2=tp2,
+        score=min(
+            100,
+            70
+            + int(
+                15 * min(r.rv / (2 * c.volume_ratio), 1)
+                + 15 * min(d * (r.close - level) / r.atr, 1)
             ),
-            details=dict(
-                current=rnd(r.close),
-                rr=net_rr(entry, stop, tp1, d, c),
-                timeframe="5m",
-                reasons=[
-                    "5m/15m/1h EMA and MACD trend",
-                    "Closed breakout",
-                    "Relative volume and RSI confirmed",
-                ],
-            ),
-        )
+        ),
+        details=dict(
+            current=rnd(r.close),
+            rr=rr,
+            timeframe="5m",
+            reasons=[
+                "5m/15m/1h EMA and MACD trend",
+                "Closed breakout",
+                "Relative volume and RSI confirmed",
+            ],
+        ),
+    )
 
 
 def transition(s, price, age, c=cfg):

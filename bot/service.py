@@ -9,8 +9,8 @@ from sqlalchemy.dialects.postgresql import insert as upsert
 
 from .config import cfg
 from .db import Delivery, Event, Instrument, Signal, User, now, sessions
-from .market import MS, rank
-from .strategy import eligible_fast, indicators, setup, transition
+from .market import MS, rank, ticker_spread_bps
+from .strategy import aligned, breakout_side, fresh, indicators, setup, transition
 
 ACTIVE = ("WAITING", "ENTRY CONFIRMED")
 log = logging.getLogger(__name__)
@@ -39,15 +39,15 @@ class Service:
         self.last_attempt = {}
         self.top = []
         self.baseline = {}
+        self.spreads = {}
         self.active = set()
         self.queue = asyncio.Queue(2048)
         self.health = {}
         self.dropped = 0
 
     def targets(self):
-        # Ranking changes within the same subscription set need no reconnect.
-        chosen = list(dict.fromkeys([*sorted(self.active), *self.top]))[:20]
-        return tuple(sorted(chosen))
+        # Only active signals use trade ticks. Ticker rank changes need no reconnect.
+        return tuple(sorted(self.active)[:20])
 
     def tick(self, symbol, price, ts):
         if (
@@ -81,17 +81,22 @@ class Service:
                 )
             )
         self.instruments = instruments
+        self.baseline = {s: v for s, v in self.baseline.items() if s in instruments}
         self.last_attempt = {
             s: t for s, t in self.last_attempt.items() if s in instruments
         }
 
     async def analyze(self, symbol):
         fast = indicators(await self.api.bars(symbol, "5m"))
-        if not eligible_fast(fast, time.time() * 1000):
+        d = breakout_side(fast, time.time() * 1000)
+        if not d:
             return
         frames = {"5m": fast}
         for tf in ("15m", "1h"):
-            frames[tf] = indicators(await self.api.bars(symbol, tf))
+            slow = indicators(await self.api.bars(symbol, tf))
+            if not fresh(slow, tf, time.time() * 1000) or not aligned(slow.iloc[-1], d):
+                return
+            frames[tf] = slow
         return setup(
             frames, int(self.instruments[symbol]["pricePrecision"]), time.time() * 1000
         )
@@ -99,9 +104,21 @@ class Service:
     async def collect(self):
         rows = await self.api.tickers()
         self.top = rank(rows, self.instruments, self.baseline)[: cfg.candidates]
+        spreads = {}
         for r in rows:
-            if r.get("closeTime") and r.get("lastPrice"):
-                self.tick(r["symbol"], float(r["lastPrice"]), int(r["closeTime"]))
+            try:
+                symbol, last, ts = (
+                    r["symbol"],
+                    float(r["lastPrice"]),
+                    int(r["closeTime"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            spread = ticker_spread_bps(r)
+            if spread is not None and symbol in self.instruments:
+                spreads[symbol] = (spread, ts)
+            self.tick(symbol, last, ts)
+        self.spreads = spreads
 
     def batch(self, slot):
         due = [s for s in self.instruments if self.last_attempt.get(s, -1) < slot]
@@ -113,40 +130,66 @@ class Service:
         oldest = sorted(due, key=lambda s: (self.last_attempt.get(s, -1), s))
         return list(dict.fromkeys(priority + oldest))[:16]
 
+    async def check(self, symbol):
+        self.last_attempt[symbol] = int(time.time() * 1000) // MS["5m"]
+        try:
+            return symbol, await self.analyze(symbol)
+        except (ValueError, KeyError, httpx.HTTPError) as exc:
+            log.warning("scan %s: %s", symbol, type(exc).__name__)
+            return symbol, None
+
     async def scan(self):
+        slot = int(time.time() * 1000) // MS["5m"]
+        workers = asyncio.Semaphore(8)
+
+        async def check(symbol):
+            async with workers:
+                return await self.check(symbol)
+
+        tasks = [asyncio.create_task(check(symbol)) for symbol in self.batch(slot)]
+        try:
+            for completed in asyncio.as_completed(tasks):
+                symbol, idea = await completed
+                if idea:
+                    await self.publish(symbol, idea)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
         slot = int(time.time() * 1000) // MS["5m"]
         self.health["5m coverage"] = (
             f"{sum(t == slot for t in self.last_attempt.values())}/{len(self.instruments)} attempted"
         )
-        for symbol in self.batch(slot):
-            self.last_attempt[symbol] = slot
-            try:
-                idea = await self.analyze(symbol)
-            except (ValueError, KeyError, httpx.HTTPError) as exc:
-                log.warning("scan %s: %s", symbol, type(exc).__name__)
-                continue
-            if not idea:
-                continue
-            async with sessions.begin() as db:
-                last = await db.scalar(
-                    select(Signal)
-                    .where(Signal.symbol == symbol)
-                    .order_by(Signal.id.desc())
-                    .limit(1)
-                )
-                if last and (
-                    last.bar == idea["bar"]
-                    or last.status in ACTIVE
-                    or now() - last.created_at < timedelta(seconds=cfg.cooldown)
-                ):
-                    continue
-                idea["symbol"] = symbol
-                s = Signal(**idea, status="WATCH")
-                db.add(s)
-                await db.flush()
-                await event(db, s, "WATCH", idea["details"]["current"])
-                await event(db, s, "WAITING", idea["details"]["current"])
-            self.active.add(symbol)
+
+    async def publish(self, symbol, idea):
+        spread, stamp = self.spreads.get(symbol, (float("inf"), 0))
+        if (
+            spread > cfg.max_spread_bps
+            or not 0 <= time.time() - stamp / 1000 <= cfg.quote_age
+        ):
+            return
+        if idea["bar"] + MS["5m"] <= time.time() * 1000 - MS["5m"]:
+            return
+        async with sessions.begin() as db:
+            last = await db.scalar(
+                select(Signal)
+                .where(Signal.symbol == symbol)
+                .order_by(Signal.id.desc())
+                .limit(1)
+            )
+            if last and (
+                last.bar == idea["bar"]
+                or last.status in ACTIVE
+                or now() - last.created_at < timedelta(seconds=cfg.cooldown)
+            ):
+                return
+            idea["symbol"] = symbol
+            s = Signal(**idea, status="WATCH")
+            db.add(s)
+            await db.flush()
+            await event(db, s, "WATCH", idea["details"]["current"])
+            await event(db, s, "WAITING", idea["details"]["current"])
+        self.active.add(symbol)
 
     async def restore(self):
         async with sessions.begin() as db:
